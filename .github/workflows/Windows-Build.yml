@@ -117,7 +117,7 @@ jobs:
 
           if ($windowsTargetPlatformVersion -ne "") {
             $propsLines.Add('  <!-- Set the Windows SDK version if not already specified to avoid MSB8036 -->')
-            $propsLines.Add("  <PropertyGroup Condition=`"'$(WindowsTargetPlatformVersion)' == ''`">")
+            $propsLines.Add('  <PropertyGroup Condition="''$(WindowsTargetPlatformVersion)'' == ''''">')
             $propsLines.Add("    <WindowsTargetPlatformVersion>$windowsTargetPlatformVersion</WindowsTargetPlatformVersion>")
             $propsLines.Add('  </PropertyGroup>')
           }

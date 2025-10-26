@@ -9,9 +9,6 @@ on:
 jobs:
   build-vncviewer:
     runs-on: windows-latest
-    strategy:
-      matrix:
-        arch: [x64]
 
     env:
       # Map matrix.arch -> PLATFORM (x86 on Windows is called Win32)

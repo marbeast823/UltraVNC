@@ -3,9 +3,14 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
 env:
   CONFIGURATION: Release
   PLATFORM: x64
+
 jobs:
   build-windows-x64:
     name: Build (windows-latest, x64, Release)
@@ -21,25 +26,40 @@ jobs:
       - name: Detect Visual Studio / MSVC / Windows SDK and create Directory.Build.props
         shell: pwsh
         run: |
-          Write-Host "Detecting Visual Studio installation path (vswhere)..."
-          # Get ProgramFiles(x86) safely
-          $progFilesX86 = if ($env:ProgramFiles(x86)) { $env:ProgramFiles(x86) } else { "C:\Program Files (x86)" }
+          Write-Host "Detecting vswhere.exe (search PATH and well-known locations)..."
 
-          # Find vswhere.exe (check common paths)
-          $vswherePath = Join-Path $progFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
-          if (-not (Test-Path $vswherePath)) {
-            # Try well-known alternate path (some runners)
-            $vswherePath = Join-Path "C:\Program Files" "Microsoft Visual Studio\Installer\vswhere.exe"
+          # Try to find vswhere in PATH first
+          $vswhereCmd = Get-Command vswhere.exe -ErrorAction SilentlyContinue
+          if ($vswhereCmd) {
+            $vswherePath = $vswhereCmd.Source
+          } else {
+            $progFilesX86 = if ($env:ProgramFiles(x86)) { $env:ProgramFiles(x86) } else { "C:\Program Files (x86)" }
+            $pathsToTry = @(
+              (Join-Path $progFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"),
+              "C:\Program Files\Microsoft Visual Studio\Installer\vswhere.exe"
+            )
+            $vswherePath = $null
+            foreach ($p in $pathsToTry) {
+              if (Test-Path $p) { $vswherePath = $p; break }
+            }
           }
-          if (-not (Test-Path $vswherePath)) {
+
+          if (-not $vswherePath) {
             Write-Error "vswhere.exe not found on runner. Cannot detect Visual Studio installation. Aborting."
             exit 1
           }
-          
-          # Find latest VS installation with C++ tools
-          $instPath = & $vswherePath -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (-not $instPath) {
+          Write-Host "vswhere found at: $vswherePath"
+
+          # Get installation path for an instance with C++ tools
+          $instPathRaw = & $vswherePath -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+          if (-not $instPathRaw) {
             Write-Error "Visual Studio installation with VC tools not found via vswhere."
+            exit 1
+          }
+          # vswhere may output newline(s); take the first non-empty trimmed line
+          $instPath = ($instPathRaw -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })[0]
+          if (-not $instPath) {
+            Write-Error "Failed to parse installationPath from vswhere output."
             exit 1
           }
           Write-Host "Visual Studio installationPath: $instPath"
@@ -47,105 +67,97 @@ jobs:
           # Find MSVC toolset directory (pick highest version)
           $msvcRoot = Join-Path $instPath "VC\Tools\MSVC"
           if (-not (Test-Path $msvcRoot)) {
-            Write-Error "MSVC root not found at $msvcRoot"
-            exit 1
-          }
-          $msvcVer = Get-ChildItem -Path $msvcRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
-          if (-not $msvcVer) {
-            Write-Error "No MSVC toolset found under $msvcRoot"
-            exit 1
-          }
-          $msvcDir = Join-Path $msvcRoot $msvcVer.Name
-          Write-Host "Using MSVC toolset: $msvcVer.Name"
-
-          # Construct atlmfc include path (contains afxres.h)
-          $atlmfcInclude = Join-Path $msvcDir "atlmfc\include"
-          if (-not (Test-Path $atlmfcInclude)) {
-            Write-Warning "ATLMFC include path not found at $atlmfcInclude. Continuing, but rc may still fail to find afxres.h."
-            $additionalInclude = ""
+            Write-Warning "MSVC root not found at $msvcRoot - resource includes may be missing."
+            $msvcDir = ""
           } else {
-            Write-Host "Found ATLMFC include: $atlmfcInclude"
-            $additionalInclude = $atlmfcInclude
-          }
-
-          # Detect highest installed Windows 10 SDK include version
-          $win10IncludeRoot = "C:\Program Files (x86)\Windows Kits\10\Include"
-          $sdkVersion = ""
-          if (Test-Path $win10IncludeRoot) {
-            $sdkVersionDir = Get-ChildItem -Path $win10IncludeRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
-            if ($sdkVersionDir) {
-              $sdkVersion = $sdkVersionDir.Name
-              Write-Host "Detected Windows 10 SDK version: $sdkVersion"
+            $msvcVer = Get-ChildItem -Path $msvcRoot -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+            if ($msvcVer) {
+              $msvcDir = Join-Path $msvcRoot $msvcVer.Name
+              Write-Host "Using MSVC toolset: $msvcVer.Name"
+            } else {
+              Write-Warning "No MSVC toolset directories found under $msvcRoot."
+              $msvcDir = ""
             }
           }
 
-          # If windows 10 sdk found use it; else fallback to an empty value (do not override)
+          # Construct atlmfc include path (contains afxres.h) if present
+          $atlmfcInclude = ""
+          if ($msvcDir -ne "") {
+            $candidate = Join-Path $msvcDir "atlmfc\include"
+            if (Test-Path $candidate) {
+              $atlmfcInclude = $candidate
+              Write-Host "Found ATLMFC include: $atlmfcInclude"
+            } else {
+              Write-Warning "ATLMFC include path not found at $candidate. Resource compile may fail to find afxres.h."
+            }
+          }
+
+          # Detect highest installed Windows SDK include version (Windows 10/11)
+          $winIncludeRoot = "C:\Program Files (x86)\Windows Kits\10\Include"
+          $sdkVersion = ""
+          if (Test-Path $winIncludeRoot) {
+            $sdkVersionDir = Get-ChildItem -Path $winIncludeRoot -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+            if ($sdkVersionDir) {
+              $sdkVersion = $sdkVersionDir.Name
+              Write-Host "Detected Windows SDK version: $sdkVersion"
+            }
+          }
+
           if ($sdkVersion -ne "") {
             $windowsTargetPlatformVersion = $sdkVersion
           } else {
             $windowsTargetPlatformVersion = ""
+            Write-Warning "Windows SDK include version not detected. Will not override WindowsTargetPlatformVersion."
           }
 
-          # --- Construct the Directory.Build.props content ---
-          
-          # 1. WindowsTargetPlatformVersion PropertyGroup - construct a clean block if version is available
-          $winPropBlock = ""
+          # Build Directory.Build.props content (include XML declaration)
+          $propsLines = New-Object System.Collections.Generic.List[string]
+          $propsLines.Add('<?xml version="1.0" encoding="utf-8"?>')
+          $propsLines.Add('<Project>')
+
           if ($windowsTargetPlatformVersion -ne "") {
-              $winPropBlock = @"
-  <!-- 
-  If WindowsTargetPlatformVersion is not explicitly defined in the project or environment, 
-  set it to the highest detected SDK version for retargeting.
-  This helps resolve MSB8036 (The Windows SDK version was not found).
-  -->
-  <PropertyGroup Condition="'$(WindowsTargetPlatformVersion)' == ''">
-    <WindowsTargetPlatformVersion>$windowsTargetPlatformVersion</WindowsTargetPlatformVersion>
-  </PropertyGroup>
-"@
+            $propsLines.Add('  <!-- Set the Windows SDK version if not already specified to avoid MSB8036 -->')
+            $propsLines.Add("  <PropertyGroup Condition=`"'$(WindowsTargetPlatformVersion)' == ''`">")
+            $propsLines.Add("    <WindowsTargetPlatformVersion>$windowsTargetPlatformVersion</WindowsTargetPlatformVersion>")
+            $propsLines.Add('  </PropertyGroup>')
           }
 
-          # 2. ResourceCompile ItemDefinitionGroup - construct a clean block if include path is available
-          $rcIncBlock = ""
-          if ($additionalInclude -ne "") {
-              $rcIncBlock = @"
-  <!-- 
-  Add the MSVC ATL/MFC include directory to ResourceCompile, which contains afxres.h. 
-  This fixes errors for resource files that reference Visual Studio resource headers.
-  -->
-  <ItemDefinitionGroup>
-    <ResourceCompile>
-      <AdditionalIncludeDirectories>$additionalInclude;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-    </ResourceCompile>
-  </ItemDefinitionGroup>
-"@
+          if ($atlmfcInclude -ne "") {
+            # Escape ampersands etc. (path typically does not contain XML-sensitive chars but be safe)
+            $escapedInclude = [System.Security.SecurityElement]::Escape($atlmfcInclude)
+            $propsLines.Add('  <!-- Add ATL/MFC include directory to ResourceCompile so resource compiler can find afxres.h -->')
+            $propsLines.Add('  <ItemDefinitionGroup>')
+            $propsLines.Add('    <ResourceCompile>')
+            $propsLines.Add("      <AdditionalIncludeDirectories>$escapedInclude;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>")
+            $propsLines.Add('    </ResourceCompile>')
+            $propsLines.Add('  </ItemDefinitionGroup>')
           }
 
-          # The multi-line string definition for the .props file
-          $propsContent = @"
-<Project>
-$winPropBlock
-$rcIncBlock
-</Project>
-"@
-          
-          # Save the content to the file
+          $propsLines.Add('</Project>')
+
           $propsPath = Join-Path $env:GITHUB_WORKSPACE "Directory.Build.props"
-          Set-Content -Path $propsPath -Value $propsContent -Encoding UTF8
-          
-          # Output the content for logging
-          Write-Host "Directory.Build.props created. Contents:"
-          Get-Content -Path $propsPath | ForEach-Object { Write-Host $_ }
+          $propsLines -join "`n" | Out-File -FilePath $propsPath -Encoding utf8 -Force
+
+          Write-Host "Directory.Build.props created at: $propsPath"
+          Get-Content $propsPath | ForEach-Object { Write-Host "  $_" }
 
       - name: Find solution file
         id: find_sln
         shell: pwsh
         run: |
-          $sln = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -Filter *.sln -ErrorAction SilentlyContinue | Select-Object -First 1
+          # Prefer top-level .sln; fallback to first found anywhere
+          $workspace = $env:GITHUB_WORKSPACE
+          $sln = Get-ChildItem -Path $workspace -Filter *.sln -File -Depth 1 -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $sln) {
+            $sln = Get-ChildItem -Path $workspace -Recurse -Filter *.sln -File -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
           if (-not $sln) {
             Write-Error "No .sln file found in repository. Ensure your solution (.sln) is committed."
             exit 1
           }
           Write-Host "Found solution: $($sln.FullName)"
-          echo "sln=$($sln.FullName)" >> $env:GITHUB_OUTPUT
+          # Export for subsequent steps
+          Add-Content -Path $env:GITHUB_OUTPUT -Value ("sln=" + $sln.FullName)
 
       - name: Restore NuGet packages (if needed)
         shell: pwsh
@@ -164,6 +176,7 @@ $rcIncBlock
         run: |
           $sln = '${{ steps.find_sln.outputs.sln }}'
           Write-Host "Building solution: $sln"
+          # Use msbuild from PATH (added by setup-msbuild). Use /m to parallelize if possible.
           msbuild "$sln" /p:Configuration=${{ env.CONFIGURATION }} /p:Platform=${{ env.PLATFORM }} /m /t:Rebuild
 
       - name: Package build outputs (zip)
@@ -174,9 +187,13 @@ $rcIncBlock
           $outZip = Join-Path $ws 'artifacts' 'UltraVNC-x64-Release.zip'
           New-Item -ItemType Directory -Path (Split-Path $outZip) -Force | Out-Null
 
-          # Search for common release directories
+          # Search for common release directories (prefer x64\Release first)
           $releaseDirs = Get-ChildItem -Path $ws -Recurse -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match '\\x64\\Release$' -or $_.FullName -match '\\Release$' -or $_.FullName -match '\\bin\\Release$' }
+            Where-Object {
+              # Normalize path separators and test patterns
+              $p = $_.FullName -replace '/', '\'
+              ($p -match '\\x64\\Release$') -or ($p -match '\\x64\\bin\\Release$') -or ($p -match '\\bin\\x64\\Release$') -or ($p -match '\\Release$')
+            }
 
           $files = @()
           if ($releaseDirs -and $releaseDirs.Count -gt 0) {
@@ -184,7 +201,7 @@ $rcIncBlock
               $files += Get-ChildItem -Path $d.FullName -Recurse -File -ErrorAction SilentlyContinue
             }
           } else {
-            # Fallback to general search for executables, libraries, and installers
+            # Fallback: common artifact file types
             $files = Get-ChildItem -Path $ws -Recurse -Include *.exe,*.dll,*.msi -File -ErrorAction SilentlyContinue
           }
 
@@ -195,18 +212,25 @@ $rcIncBlock
 
           $tempDir = Join-Path $env:TEMP ('ultravnc-pack-' + [guid]::NewGuid().ToString())
           New-Item -ItemType Directory -Path $tempDir | Out-Null
-          
-          # Copy files to a flat directory structure for zipping
+
+          # Copy files to a flat directory structure for zipping (avoid collisions by prefixing if necessary)
           foreach ($f in $files) {
-            $dest = Join-Path $tempDir (Split-Path $f.FullName -Leaf)
+            $leaf = (Split-Path $f.FullName -Leaf)
+            $dest = Join-Path $tempDir $leaf
+            $counter = 1
+            while (Test-Path $dest) {
+              # append numeric suffix if collision
+              $dest = Join-Path $tempDir ("{0}_{1}{2}" -f ([IO.Path]::GetFileNameWithoutExtension($leaf)), $counter, [IO.Path]::GetExtension($leaf))
+              $counter++
+            }
             Copy-Item -Path $f.FullName -Destination $dest -Force
           }
 
           if (Test-Path $outZip) { Remove-Item $outZip -Force }
-          Compress-Archive -Path (Join-Path $tempDir '*') -DestinationPath $outZip -Force
+          Compress-Archive -Path (Join-Path $tempDir '*') -DestinationPath $outZip -CompressionLevel Optimal -Force
           Remove-Item -Recurse -Force $tempDir
 
-          echo "artifact=$outZip" >> $env:GITHUB_OUTPUT
+          Add-Content -Path $env:GITHUB_OUTPUT -Value ("artifact=" + $outZip)
 
       - name: Upload artifact (UltraVNC x64 Release)
         uses: actions/upload-artifact@v4

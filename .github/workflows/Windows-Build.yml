@@ -33,7 +33,7 @@ jobs:
           if ($vswhereCmd) {
             $vswherePath = $vswhereCmd.Source
           } else {
-            $progFilesX86 = if ($env:ProgramFiles(x86)) { $env:ProgramFiles(x86) } else { "C:\Program Files (x86)" }
+            $progFilesX86 = if { $env:ProgramFiles(x86) } else { "C:\Program Files (x86)" }
             $pathsToTry = @(
               (Join-Path $progFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"),
               "C:\Program Files\Microsoft Visual Studio\Installer\vswhere.exe"

@@ -114,22 +114,6 @@ jobs:
           }
 
           $propsContent = @"
-<Project>
-  <PropertyGroup>
-    <!-- If the projects request Windows SDK 8.1 and it's not present, override to a present Windows 10 SDK -->
-    <!-- Empty WindowsTargetPlatformVersion means do not override -->
-    $(if ($windowsTargetPlatformVersion) { "<WindowsTargetPlatformVersion>$windowsTargetPlatformVersion</WindowsTargetPlatformVersion>" } else { "" })
-  </PropertyGroup>
-
-  <!-- Ensure resource compiler has access to ATLMFC include (contains afxres.h) -->
-  <ItemDefinitionGroup>
-    <ResourceCompile>
-      <!-- Prepend absolute atlmfc include path so rc.exe can find afxres.h. Keep existing AdditionalIncludeDirectories -->
-      $(if ($additionalInclude) { "<AdditionalIncludeDirectories>$additionalInclude;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>" } else { "" })
-    </ResourceCompile>
-  </ItemDefinitionGroup>
-</Project>
-"@
 
           # The above uses PowerShell interpolation; write with correct content
           if ($windowsTargetPlatformVersion -ne "") {

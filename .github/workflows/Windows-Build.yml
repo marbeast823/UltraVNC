@@ -1,0 +1,50 @@
+name: Build UltraVNC (vncviewer) on Windows
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-vncviewer:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - config: Release
+            arch: x64
+            platform: x64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install NASM (required by some projects)
+        run: choco install nasm -y
+        shell: pwsh
+
+      - name: Verify NASM
+        run: nasm -v
+        shell: pwsh
+
+      - name: Build vncviewer solution
+        run: msbuild vncviewer\\vncviewer.sln /p:Configuration=${{ matrix.config }} /p:Platform=${{ matrix.platform }} /m
+        shell: pwsh
+
+      - name: Collect build outputs
+        run: |
+          $out = "artifacts/$($env:GITHUB_RUN_ID)-${{ matrix.config }}-${{ matrix.arch }}"
+          New-Item -Path $out -ItemType Directory -Force | Out-Null
+          # Copy .exe and .dll files from likely output folders. Adjust patterns if needed.
+          Get-ChildItem -Path . -Include *.exe,*.dll -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "vncviewer" -or $_.Name -match 'vncviewer|winvnc' } |
+            ForEach-Object { Copy-Item $_.FullName -Destination $out -Force }
+          Write-Host "Artifacts collected to: $out"
+        shell: pwsh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ultravnc-${{ matrix.config }}-${{ matrix.arch }}
+          path: artifacts/*

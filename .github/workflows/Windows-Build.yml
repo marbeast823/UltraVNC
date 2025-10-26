@@ -11,10 +11,11 @@ jobs:
     runs-on: windows-latest
     strategy:
       matrix:
-        include:
-          - config: Release
-            arch: x64
-            platform: x64
+        arch: [x64]
+
+    env:
+      # Map matrix.arch -> PLATFORM (x86 on Windows is called Win32)
+      PLATFORM: ${{ matrix.arch == 'x64' && 'x64' || 'Win32' }}
 
     steps:
       - name: Check out repository
@@ -28,20 +29,76 @@ jobs:
         run: nasm -v
         shell: pwsh
 
-      - name: Build vncviewer solution
-        run: msbuild vncviewer\\vncviewer.sln /p:Configuration=${{ matrix.config }} /p:Platform=${{ matrix.platform }} /m
+      - name: Build vncviewer solution (locate MSBuild via vswhere)
         shell: pwsh
+        run: |
+          $vswherePaths = @(
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe",
+            "${env:ProgramFiles}\Microsoft Visual Studio\Installer\vswhere.exe"
+          )
+
+          $vswhere = $vswherePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $vswhere) {
+            Write-Error "vswhere.exe not found. Cannot locate Visual Studio/MSBuild."
+            exit 1
+          }
+
+          # Find latest VS installation that contains MSBuild
+          $instPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $instPath) {
+            Write-Error "No Visual Studio installation with MSBuild found."
+            exit 1
+          }
+
+          # Try MSBuild current path, fallback to common older path
+          $msbuild = Join-Path $instPath "MSBuild\Current\Bin\MSBuild.exe"
+          if (-not (Test-Path $msbuild)) {
+            $msbuild = Join-Path $instPath "MSBuild\15.0\Bin\MSBuild.exe"
+          }
+
+          if (-not (Test-Path $msbuild)) {
+            # As a last resort, try msbuild on PATH
+            $cmd = Get-Command msbuild.exe -ErrorAction SilentlyContinue
+            if ($cmd) {
+              $msbuild = $cmd.Path
+            } else {
+              Write-Error "MSBuild.exe not found via vswhere or PATH."
+              exit 1
+            }
+          }
+
+          Write-Host "Using MSBuild: $msbuild"
+          $sln = "vncviewer\vncviewer.sln"
+          if (-not (Test-Path $sln)) {
+            Write-Error "Solution file not found: $sln"
+            exit 1
+          }
+
+          # Use PLATFORM from env (mapped in job env)
+          Write-Host "Building solution: $sln (Configuration=${{ matrix.config }}, Platform=$env:PLATFORM)"
+          & $msbuild $sln /p:Configuration=${{ matrix.config }} /p:Platform=$env:PLATFORM /m
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "MSBuild failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
 
       - name: Collect build outputs
+        shell: pwsh
         run: |
           $out = "artifacts/$($env:GITHUB_RUN_ID)-${{ matrix.config }}-${{ matrix.arch }}"
           New-Item -Path $out -ItemType Directory -Force | Out-Null
-          # Copy .exe and .dll files from likely output folders. Adjust patterns if needed.
+
+          # Collect likely outputs - adjust patterns if your solution outputs elsewhere
           Get-ChildItem -Path . -Include *.exe,*.dll -Recurse -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -match "vncviewer" -or $_.Name -match 'vncviewer|winvnc' } |
             ForEach-Object { Copy-Item $_.FullName -Destination $out -Force }
+
+          # Also collect PDBs for debugging builds (optional)
+          Get-ChildItem -Path . -Include *.pdb -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "vncviewer" } |
+            ForEach-Object { Copy-Item $_.FullName -Destination $out -Force }
+
           Write-Host "Artifacts collected to: $out"
-        shell: pwsh
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
